@@ -1,5 +1,8 @@
 # AI Agent
 A stream chat ai agent web application build by react and python
+## Demo
+http://139.196.93.191/assistantui
+
 
 # Python langgraph fast api
 online search tool: https://www.tavily.com/
