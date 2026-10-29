@@ -5,9 +5,12 @@ http://139.196.93.191/assistantui
 
 
 # Python langgraph fast api
+
 online search tool: https://www.tavily.com/
 
-cd backend and creat.env to input your apikeys
+suggested Open AI api: https://api.chatanywhere.tech/
+
+cd backend and creat .env file to setup your api keys
 
 ```
 python3.12 -m venv .venv
