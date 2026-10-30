@@ -13,13 +13,12 @@ suggested Open AI api: https://api.chatanywhere.tech/
 cd backend and creat .env file to setup your api keys
 
 ```
-python3.12 -m venv .venv
 
+/opt/homebrew/bin/python3.13 -m venv .venv
 source .venv/bin/activate
-
-pip install -e . "langgraph-cli[inmem]"
-
+.venv/bin/python -m pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple
 uvicorn agent.api:app --reload --port 8000 --env-file .env
+
 ```
 
 # React + Vite

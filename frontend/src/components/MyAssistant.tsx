@@ -1,10 +1,15 @@
 import { Thread } from "@/components/assistant-ui/elements/thread.aui";
-import { streamChat } from "@/lib/chatApi";
+import { loadMessages, streamChat } from "@/lib/chatApi";
+import { ImageAttachmentAdapter } from "@/lib/imageAttachment";
 import {
   AssistantRuntimeProvider,
   useLocalRuntime,
   type ChatModelAdapter,
+  type ThreadMessageLike,
 } from "@assistant-ui/react";
+import { useEffect, useState } from "react";
+
+const imageAttachment = new ImageAttachmentAdapter();
 
 const chatModel: ChatModelAdapter = {
   async *run({ messages, abortSignal }) {
@@ -26,8 +31,15 @@ const chatModel: ChatModelAdapter = {
   },
 };
 
-export function MyAssistant() {
-  const runtime = useLocalRuntime(chatModel);
+function AssistantThread({
+  initialMessages,
+}: {
+  initialMessages: ThreadMessageLike[];
+}) {
+  const runtime = useLocalRuntime(chatModel, {
+    initialMessages,
+    adapters: { attachments: imageAttachment },
+  });
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -36,4 +48,30 @@ export function MyAssistant() {
       </div>
     </AssistantRuntimeProvider>
   );
+}
+
+export function MyAssistant() {
+  const [initialMessages, setInitialMessages] = useState<
+    ThreadMessageLike[] | null
+  >(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadMessages()
+      .then((messages) => {
+        if (!cancelled) setInitialMessages(messages);
+      })
+      .catch(() => {
+        if (!cancelled) setInitialMessages([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (initialMessages === null) {
+    return <div className="h-dvh" />;
+  }
+
+  return <AssistantThread initialMessages={initialMessages} />;
 }
