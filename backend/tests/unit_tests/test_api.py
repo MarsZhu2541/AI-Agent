@@ -1,9 +1,28 @@
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 
 from agent import history
-from agent.api import ChatRequest, app, graph, to_langchain, transcript_of
+from agent.api import ChatRequest, app, to_langchain, transcript_of
+from agent.downloads import prepare_download
+
+
+def _chat(response) -> tuple[str, list[dict]]:
+    text: list[str] = []
+    files: list[dict] = []
+    for line in response.text.splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if event["type"] == "text":
+            text.append(event["text"])
+        elif event["type"] == "file":
+            files.append(event)
+        else:
+            raise AssertionError(event)
+    return "".join(text), files
 
 
 def _convert(messages: list[dict]) -> list:
@@ -41,7 +60,7 @@ def test_chat_endpoint_streams_model_text(monkeypatch) -> None:
         yield (AIMessageChunk(content="pon"), {})
         yield (AIMessageChunk(content="g"), {})
 
-    monkeypatch.setattr(graph, "astream", fake_stream)
+    monkeypatch.setattr("agent.api.stream_agent", fake_stream)
 
     with TestClient(app) as client:
         response = client.post(
@@ -50,7 +69,7 @@ def test_chat_endpoint_streams_model_text(monkeypatch) -> None:
         )
 
     assert response.status_code == 200
-    assert response.text == "pong"
+    assert _chat(response) == ("pong", [])
 
 
 def test_to_langchain_keeps_text_messages() -> None:
@@ -145,7 +164,7 @@ def test_chat_forwards_image_blocks(monkeypatch) -> None:
         seen["messages"] = state["messages"]
         yield (AIMessageChunk(content="一只猫"), {})
 
-    monkeypatch.setattr(graph, "astream", fake_stream)
+    monkeypatch.setattr("agent.api.stream_agent", fake_stream)
 
     with TestClient(app) as client:
         response = client.post(
@@ -164,7 +183,7 @@ def test_chat_forwards_image_blocks(monkeypatch) -> None:
         )
 
     assert response.status_code == 200
-    assert response.text == "一只猫"
+    assert _chat(response)[0] == "一只猫"
     assert seen["messages"][0].content[1]["image_url"]["url"].startswith(
         "data:image/png;base64,"
     )
@@ -183,7 +202,7 @@ def test_chat_saves_the_full_thread(memory_history: list[dict], monkeypatch) -> 
         yield (AIMessageChunk(content="pon"), {})
         yield (AIMessageChunk(content="g"), {})
 
-    monkeypatch.setattr(graph, "astream", fake_stream)
+    monkeypatch.setattr("agent.api.stream_agent", fake_stream)
 
     with TestClient(app) as client:
         first = client.post(
@@ -191,7 +210,7 @@ def test_chat_saves_the_full_thread(memory_history: list[dict], monkeypatch) -> 
             json={"messages": [{"role": "user", "content": "ping"}]},
         )
         assert first.status_code == 200
-        assert first.text == "pong"
+        assert _chat(first)[0] == "pong"
         saved = client.get("/api/messages")
 
         second = client.post(
@@ -222,7 +241,7 @@ def test_chat_saves_image_content(memory_history: list[dict], monkeypatch) -> No
     async def fake_stream(*_args, **_kwargs):
         yield (AIMessageChunk(content="一只猫"), {})
 
-    monkeypatch.setattr(graph, "astream", fake_stream)
+    monkeypatch.setattr("agent.api.stream_agent", fake_stream)
     sent = [
         {
             "role": "user",
@@ -239,6 +258,46 @@ def test_chat_saves_image_content(memory_history: list[dict], monkeypatch) -> No
     assert response.status_code == 200
     assert memory_history[0]["content"] == sent[0]["content"]
     assert memory_history[1] == {"role": "assistant", "content": "一只猫"}
+
+
+def test_chat_streams_a_file_for_confirmation(
+    memory_history: list[dict], monkeypatch
+) -> None:
+    async def fake_stream(*_args, **_kwargs):
+        message = await prepare_download.ainvoke(
+            {"filename": "note.txt", "content": "hello"}
+        )
+        assert "已生成" in message
+        yield (AIMessageChunk(content="请确认下载"), {})
+
+    monkeypatch.setattr("agent.api.stream_agent", fake_stream)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat",
+            json={"messages": [{"role": "user", "content": "写个文件"}]},
+        )
+
+    text, files = _chat(response)
+    assert response.status_code == 200
+    assert text == "请确认下载"
+    assert files == [
+        {
+            "type": "file",
+            "filename": "note.txt",
+            "content": "hello",
+            "mime": "text/plain",
+        }
+    ]
+    assert memory_history[1]["content"] == [
+        {"type": "text", "text": "请确认下载"},
+        {
+            "type": "file",
+            "filename": "note.txt",
+            "content": "hello",
+            "mime": "text/plain",
+        },
+    ]
 
 
 def test_transcript_skips_an_empty_reply() -> None:

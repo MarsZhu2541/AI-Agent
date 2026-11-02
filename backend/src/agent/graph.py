@@ -16,7 +16,11 @@ from .tools import tools
 
 model = ChatOpenAI(model="deepseek-v4.1-flash")
 
-DEFAULT_SYSTEM = "You are a helpful assistant."
+DEFAULT_SYSTEM = (
+    "You are a helpful assistant. "
+    "当用户想要文件时，调用 prepare_download 生成文本文件。"
+    "文件要等用户在页面上确认后才会下载，回复里不要贴出整份文件。"
+)
 
 DEFAULT_THREAD_ID = "default"
 

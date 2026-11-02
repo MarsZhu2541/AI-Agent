@@ -1,5 +1,11 @@
+import { DownloadFileToolUI } from "@/components/DownloadFile";
 import { Thread } from "@/components/assistant-ui/elements/thread.aui";
-import { loadMessages, streamChat } from "@/lib/chatApi";
+import {
+  assistantParts,
+  loadMessages,
+  streamChat,
+  type DownloadProposal,
+} from "@/lib/chatApi";
 import { ImageAttachmentAdapter } from "@/lib/imageAttachment";
 import {
   AssistantRuntimeProvider,
@@ -13,20 +19,14 @@ const imageAttachment = new ImageAttachmentAdapter();
 
 const chatModel: ChatModelAdapter = {
   async *run({ messages, abortSignal }) {
-    const reader = await streamChat(messages, abortSignal);
-    const decoder = new TextDecoder();
     let text = "";
+    const files: DownloadProposal[] = [];
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      text += decoder.decode(value, { stream: true });
-      yield { content: [{ type: "text", text }] };
-    }
-
-    text += decoder.decode();
-    if (text) {
-      yield { content: [{ type: "text", text }] };
+    for await (const event of streamChat(messages, abortSignal)) {
+      if (event.type === "text") text += event.text;
+      else files.push(event);
+      const content = assistantParts(text, files);
+      if (content.length > 0) yield { content };
     }
   },
 };
@@ -43,6 +43,7 @@ function AssistantThread({
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
+      <DownloadFileToolUI />
       <div className="h-dvh">
         <Thread />
       </div>

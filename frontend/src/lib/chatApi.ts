@@ -2,7 +2,57 @@ import type { ThreadMessage, ThreadMessageLike } from "@assistant-ui/react";
 
 type ChatTextPart = { type: "text"; text: string };
 type ChatImagePart = { type: "image"; image: string };
-type ChatContent = string | Array<ChatTextPart | ChatImagePart>;
+type ChatFilePart = {
+  type: "file";
+  filename: string;
+  content: string;
+  mime: string;
+};
+type ChatPart = ChatTextPart | ChatImagePart | ChatFilePart;
+type ChatContent = string | ChatPart[];
+
+export type DownloadProposal = {
+  filename: string;
+  content: string;
+  mime: string;
+};
+
+export type ChatEvent =
+  | { type: "text"; text: string }
+  | ({ type: "file" } & DownloadProposal);
+
+const TOOL_NAME = "prepare_download";
+
+export function assistantParts(text: string, files: readonly DownloadProposal[]) {
+  const content: Array<
+    | { type: "text"; text: string }
+    | {
+        type: "tool-call";
+        toolCallId: string;
+        toolName: typeof TOOL_NAME;
+        args: DownloadProposal;
+        argsText: string;
+        result: { ready: true };
+      }
+  > = [];
+  if (text) content.push({ type: "text", text });
+  files.forEach((file, index) => {
+    const args = {
+      filename: file.filename,
+      content: file.content,
+      mime: file.mime,
+    };
+    content.push({
+      type: "tool-call",
+      toolCallId: `${TOOL_NAME}-${index}`,
+      toolName: TOOL_NAME,
+      args,
+      argsText: JSON.stringify(args),
+      result: { ready: true },
+    });
+  });
+  return content;
+}
 
 const IMAGE_URL =
   /^(?:https?:\/\/\S+|data:image\/(?:jpeg|jpg|png|gif|webp);base64,[a-z0-9+/=\s]+)$/i;
@@ -34,8 +84,32 @@ const imagePartsOf = (message: ThreadMessage): ChatImagePart[] => {
   return images;
 };
 
+const downloadPartsOf = (message: ThreadMessage): ChatFilePart[] => {
+  if (message.role === "user") return [];
+  const files: ChatFilePart[] = [];
+  for (const part of message.content) {
+    if (part.type !== "tool-call" || part.toolName !== TOOL_NAME) continue;
+    const filename = part.args.filename;
+    const content = part.args.content;
+    const mime = part.args.mime;
+    if (typeof filename !== "string" || typeof content !== "string") continue;
+    files.push({
+      type: "file",
+      filename,
+      content,
+      mime: typeof mime === "string" ? mime : "text/plain",
+    });
+  }
+  return files;
+};
+
 const contentOf = (message: ThreadMessage): ChatContent => {
-  if (message.role !== "user") return textOf(message);
+  if (message.role !== "user") {
+    const text = textOf(message);
+    const files = downloadPartsOf(message);
+    if (files.length === 0) return text;
+    return [...(text ? [{ type: "text" as const, text }] : []), ...files];
+  }
 
   const images = imagePartsOf(message);
   const text = textOf(message).trim();
@@ -73,6 +147,15 @@ const toThreadMessage = (message: HistoryMessage): ThreadMessageLike | null => {
   };
 };
 
+const fileProposalOf = (part: ChatPart): DownloadProposal | null => {
+  if (part.type !== "file") return null;
+  return {
+    filename: part.filename,
+    content: part.content,
+    mime: part.mime || "text/plain",
+  };
+};
+
 const normalizeHistoryContent = (
   content: ChatContent | undefined,
   role: HistoryMessage["role"],
@@ -81,10 +164,16 @@ const normalizeHistoryContent = (
   if (!Array.isArray(content)) return null;
 
   if (role !== "user") {
-    return content
+    const text = content
       .filter((part) => part.type === "text")
       .map((part) => part.text)
       .join("");
+    const files = content.flatMap((part) => {
+      const file = fileProposalOf(part);
+      return file ? [file] : [];
+    });
+    if (files.length === 0) return text;
+    return assistantParts(text, files);
   }
 
   const parts: Array<
@@ -117,10 +206,10 @@ export async function loadMessages(): Promise<ThreadMessageLike[]> {
   });
 }
 
-export async function streamChat(
+export async function* streamChat(
   messages: readonly ThreadMessage[],
   signal: AbortSignal,
-): Promise<ReadableStreamDefaultReader<Uint8Array>> {
+): AsyncGenerator<ChatEvent> {
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -137,5 +226,21 @@ export async function streamChat(
     throw new Error(`Chat request failed: ${response.status}`);
   }
 
-  return response.body.getReader();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = done ? "" : (lines.pop() ?? "");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      yield JSON.parse(line) as ChatEvent;
+    }
+    if (done) {
+      if (buffer.trim()) yield JSON.parse(buffer) as ChatEvent;
+      break;
+    }
+  }
 }

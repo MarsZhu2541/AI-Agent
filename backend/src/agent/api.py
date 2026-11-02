@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +22,14 @@ from langchain_core.messages import (
 from pydantic import BaseModel, Field
 
 from agent import history
-from agent.graph import stream_agent  # 改为走带 thread_id 的流式入口
+from agent.downloads import (
+    PreparedFile,
+    bind_prepared_files,
+    parse_download,
+    reset_prepared_files,
+    take_prepared_files,
+)
+from agent.graph import stream_agent
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +75,14 @@ class ImagePart(BaseModel):
     image: str
 
 
-ContentPart = Annotated[TextPart | ImagePart, Field(discriminator="type")]
+class FilePart(BaseModel):
+    type: Literal["file"]
+    filename: str
+    content: str
+    mime: str = "text/plain"
+
+
+ContentPart = Annotated[TextPart | ImagePart | FilePart, Field(discriminator="type")]
 
 
 class ChatMessage(BaseModel):
@@ -118,6 +133,8 @@ def _user_content(content: str | list[ContentPart]) -> str | list[dict[str, obje
     blocks: list[dict[str, object]] = []
     images = 0
     for part in content:
+        if isinstance(part, FilePart):
+            continue
         if isinstance(part, TextPart):
             if part.text:
                 blocks.append({"type": "text", "text": part.text})
@@ -163,9 +180,49 @@ def chunk_text(chunk: AIMessage | AIMessageChunk) -> str:
     return "".join(parts)
 
 
-def transcript_of(body: ChatRequest, reply: str) -> list[dict[str, object]]:
-    stored = [message.model_dump() for message in body.messages]
-    if reply:
+def _stored_content(content: Any) -> Any:
+    """Drop file parts that no longer pass the download checks."""
+    if not isinstance(content, list):
+        return content
+    kept: list[Any] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "file":
+            kept.append(part)
+            continue
+        parsed = parse_download(str(part.get("filename", "")), str(part.get("content", "")))
+        if isinstance(parsed, PreparedFile):
+            kept.append(parsed.as_part())
+    if not kept:
+        return ""
+    if len(kept) == 1 and kept[0].get("type") == "text":
+        return kept[0]["text"]
+    return kept
+
+
+def _event(payload: dict[str, object]) -> str:
+    """Encode one stream event as a single NDJSON line."""
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def transcript_of(
+    body: ChatRequest,
+    reply: str,
+    files: list[PreparedFile] | None = None,
+) -> list[dict[str, object]]:
+    """Build the full thread to store, including the finished reply and files."""
+    stored: list[dict[str, object]] = []
+    for message in body.messages:
+        item = message.model_dump()
+        item["content"] = _stored_content(item["content"])
+        stored.append(item)
+    prepared = list(files or [])
+    if prepared:
+        parts: list[dict[str, str]] = []
+        if reply:
+            parts.append({"type": "text", "text": reply})
+        parts.extend(file.as_part() for file in prepared)
+        stored.append({"role": "assistant", "content": parts})
+    elif reply:
         stored.append({"role": "assistant", "content": reply})
     return stored
 
@@ -181,7 +238,7 @@ async def messages() -> dict[str, list[dict[str, object]]]:
 
 @app.post("/api/chat")
 async def chat(body: ChatRequest) -> StreamingResponse:
-    """Stream the graph reply as plain text."""
+    """Stream text and file proposals as NDJSON."""
     try:
         messages = to_langchain(body.messages)
     except ValueError as exc:
@@ -189,24 +246,39 @@ async def chat(body: ChatRequest) -> StreamingResponse:
 
     async def stream() -> AsyncIterator[str]:
         parts: list[str] = []
-        # 关键改动：走 stream_agent，它会补齐 thread_id
-        async for item in stream_agent(
-            {"messages": messages},
-            stream_mode="messages",
-        ):
-            chunk = item[0] if isinstance(item, tuple) else item
-            if not isinstance(chunk, (AIMessage, AIMessageChunk)):
-                continue
-            text = chunk_text(chunk)
-            if text:
-                parts.append(text)
-                yield text
+        files: list[PreparedFile] = []
+        token = bind_prepared_files()
+        try:
+            async for item in stream_agent(
+                {"messages": messages},
+                stream_mode="messages",
+            ):
+                for prepared in take_prepared_files():
+                    files.append(prepared)
+                    yield _event({"type": "file", **prepared.as_part()})
+                chunk = item[0] if isinstance(item, tuple) else item
+                if not isinstance(chunk, (AIMessage, AIMessageChunk)):
+                    continue
+                text = chunk_text(chunk)
+                if text:
+                    parts.append(text)
+                    yield _event({"type": "text", "text": text})
+            for prepared in take_prepared_files():
+                files.append(prepared)
+                yield _event({"type": "file", **prepared.as_part()})
+            reply = "".join(parts)
+            if files and not reply:
+                reply = "文件已生成，确认后即可下载。"
+                parts.append(reply)
+                yield _event({"type": "text", "text": reply})
+        finally:
+            reset_prepared_files(token)
 
         if not body.messages:
             return
         try:
-            await history.replace_messages(transcript_of(body, "".join(parts)))
+            await history.replace_messages(transcript_of(body, "".join(parts), files))
         except Exception:
             logger.exception("failed to save chat history")
 
-    return StreamingResponse(stream(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(stream(), media_type="application/x-ndjson; charset=utf-8")

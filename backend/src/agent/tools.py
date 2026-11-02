@@ -10,6 +10,8 @@ import httpx
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 
+from .downloads import prepare_download
+
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 logger = logging.getLogger(__name__)
@@ -115,4 +117,4 @@ async def search_web(query: Annotated[str, "搜索关键词，尽量具体"]) ->
     return await _search(cleaned)
 
 
-tools = [search_web]
+tools = [search_web, prepare_download]
