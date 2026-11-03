@@ -5,8 +5,16 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 
 from agent import history
-from agent.api import ChatRequest, app, to_langchain, transcript_of
+from agent.api import ChatRequest, agent_reply_text, app, to_langchain, transcript_of
 from agent.downloads import prepare_download
+
+
+def test_agent_reply_text_hides_the_route_decision() -> None:
+    hidden = (AIMessageChunk(content="no"), {"langgraph_node": "__start__"})
+    visible = (AIMessageChunk(content="好"), {"langgraph_node": "agent"})
+
+    assert agent_reply_text(hidden) == ""
+    assert agent_reply_text(visible) == "好"
 
 
 def _chat(response) -> tuple[str, list[dict]]:
@@ -31,7 +39,7 @@ def _convert(messages: list[dict]) -> list:
 
 @pytest.fixture(autouse=True)
 def memory_history(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
-    """Keep unit tests off the real MySQL database."""
+    """Keep unit tests off the real PostgreSQL database."""
     stored: list[dict] = []
 
     async def init_db() -> None:

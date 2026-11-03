@@ -60,7 +60,7 @@ app.add_middleware(
         "http://localhost:5174",
         "http://127.0.0.1:5174",
     ],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -91,6 +91,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    session_id: str
     messages: list[ChatMessage] = Field(default_factory=list)
 
 
@@ -167,6 +168,18 @@ def to_langchain(messages: list[ChatMessage]) -> list[BaseMessage]:
     return converted
 
 
+def agent_reply_text(item: object) -> str:
+    """Return streamed text from the answer node, skipping the route decision."""
+    if not isinstance(item, tuple) or len(item) < 2:
+        return ""
+    chunk, metadata = item[0], item[1]
+    if not isinstance(metadata, dict) or metadata.get("langgraph_node") != "agent":
+        return ""
+    if not isinstance(chunk, (AIMessage, AIMessageChunk)):
+        return ""
+    return chunk_text(chunk)
+
+
 def chunk_text(chunk: AIMessage | AIMessageChunk) -> str:
     content = chunk.content
     if isinstance(content, str):
@@ -227,13 +240,13 @@ def transcript_of(
     return stored
 
 
-@app.get("/api/messages")
-async def messages() -> dict[str, list[dict[str, object]]]:
+@app.get("/api/messages/{session_id}")
+async def messages(session_id: str) -> dict[str, list[dict[str, object]]]:
     try:
-        return {"messages": await history.list_messages()}
+        return {"messages": await history.list_messages(session_id)}
     except Exception as exc:
-        logger.exception("failed to load chat history")
-        raise HTTPException(status_code=503, detail="无法读取消息记录") from exc
+        logger.exception("failed to load session messages")
+        raise HTTPException(status_code=503, detail="无法读取会话消息记录") from exc
 
 
 @app.post("/api/chat")
@@ -241,6 +254,10 @@ async def chat(body: ChatRequest) -> StreamingResponse:
     """Stream text and file proposals as NDJSON."""
     try:
         messages = to_langchain(body.messages)
+        session_id = body.session_id.strip()
+        if not session_id:
+            raise HTTPException(status_code=400, detail="缺少 session_id")
+
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -251,15 +268,13 @@ async def chat(body: ChatRequest) -> StreamingResponse:
         try:
             async for item in stream_agent(
                 {"messages": messages},
+                {"configurable": {"session_id": session_id}},
                 stream_mode="messages",
             ):
                 for prepared in take_prepared_files():
                     files.append(prepared)
                     yield _event({"type": "file", **prepared.as_part()})
-                chunk = item[0] if isinstance(item, tuple) else item
-                if not isinstance(chunk, (AIMessage, AIMessageChunk)):
-                    continue
-                text = chunk_text(chunk)
+                text = agent_reply_text(item)
                 if text:
                     parts.append(text)
                     yield _event({"type": "text", "text": text})
@@ -277,8 +292,26 @@ async def chat(body: ChatRequest) -> StreamingResponse:
         if not body.messages:
             return
         try:
-            await history.replace_messages(transcript_of(body, "".join(parts), files))
+            await history.replace_messages(transcript_of(body, "".join(parts), files), session_id)
         except Exception:
             logger.exception("failed to save chat history")
-
+    
     return StreamingResponse(stream(), media_type="application/x-ndjson; charset=utf-8")
+
+
+
+@app.get("/api/sessions")
+async def sessions() -> dict[str, list[dict[str, object]]]:
+    try:
+        return {"sessions": await history.list_sessions()}
+    except Exception as exc:
+        logger.exception("failed to load chat history")
+        raise HTTPException(status_code=503, detail="无法读取会话记录") from exc
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_sessions(session_id: str):
+    try:
+        await history.delete_session(session_id)
+    except Exception as exc:
+        logger.exception("failed to delete session")
+        raise HTTPException(status_code=503, detail="无法读取消息记录") from exc

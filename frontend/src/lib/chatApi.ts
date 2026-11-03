@@ -193,8 +193,25 @@ const normalizeHistoryContent = (
   return parts;
 };
 
-export async function loadMessages(): Promise<ThreadMessageLike[]> {
-  const response = await fetch("/api/messages");
+export type ChatSessionSummary = {
+  id: string;
+  title: string;
+  updatedAt: string;
+};
+
+export async function loadSessions(): Promise<ChatSessionSummary[]> {
+  const response = await fetch("/api/sessions");
+  if (!response.ok) {
+    throw new Error(`Sessions request failed: ${response.status}`);
+  }
+  const body = (await response.json()) as { sessions?: ChatSessionSummary[] };
+  return body.sessions ?? [];
+}
+
+export async function loadMessages(sessionId: string): Promise<ThreadMessageLike[]> {
+  const response = await fetch(
+    `/api/messages/${encodeURIComponent(sessionId)}`,
+  );
   if (!response.ok) {
     throw new Error(`History request failed: ${response.status}`);
   }
@@ -207,6 +224,7 @@ export async function loadMessages(): Promise<ThreadMessageLike[]> {
 }
 
 export async function* streamChat(
+  sessionId: string,
   messages: readonly ThreadMessage[],
   signal: AbortSignal,
 ): AsyncGenerator<ChatEvent> {
@@ -214,6 +232,7 @@ export async function* streamChat(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      session_id: sessionId,
       messages: messages.map((message) => ({
         role: message.role,
         content: contentOf(message),
