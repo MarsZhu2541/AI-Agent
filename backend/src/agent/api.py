@@ -274,7 +274,7 @@ async def image(image_id: int) -> Response:
 @app.get("/aiapi/messages/{session_id}")
 async def messages(session_id: str) -> dict[str, list[dict[str, object]]]:
     try:
-        return {"messages": await history.list_messages(session_id)};123
+        return {"messages": await history.list_messages(session_id)}
     except Exception as exc:
         logger.exception("failed to load session messages")
         raise HTTPException(status_code=503, detail="无法读取会话消息记录") from exc
