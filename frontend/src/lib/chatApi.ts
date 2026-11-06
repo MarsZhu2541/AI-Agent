@@ -55,7 +55,7 @@ export function assistantParts(text: string, files: readonly DownloadProposal[])
 }
 
 const IMAGE_URL =
-  /^(?:https?:\/\/\S+|data:image\/(?:jpeg|jpg|png|gif|webp);base64,[a-z0-9+/=\s]+)$/i;
+  /^(?:https?:\/\/\S+|\/aiapi\/images\/\d+|data:image\/(?:jpeg|jpg|png|gif|webp);base64,[a-z0-9+/=\s]+)$/i;
 
 const textOf = (message: ThreadMessage) =>
   message.content
@@ -200,7 +200,7 @@ export type ChatSessionSummary = {
 };
 
 export async function loadSessions(): Promise<ChatSessionSummary[]> {
-  const response = await fetch("/api/sessions");
+  const response = await fetch("/aiapi/sessions");
   if (!response.ok) {
     throw new Error(`Sessions request failed: ${response.status}`);
   }
@@ -210,7 +210,7 @@ export async function loadSessions(): Promise<ChatSessionSummary[]> {
 
 export async function loadMessages(sessionId: string): Promise<ThreadMessageLike[]> {
   const response = await fetch(
-    `/api/messages/${encodeURIComponent(sessionId)}`,
+    `/aiapi/messages/${encodeURIComponent(sessionId)}`,
   );
   if (!response.ok) {
     throw new Error(`History request failed: ${response.status}`);
@@ -228,7 +228,7 @@ export async function* streamChat(
   messages: readonly ThreadMessage[],
   signal: AbortSignal,
 ): AsyncGenerator<ChatEvent> {
-  const response = await fetch("/api/chat", {
+  const response = await fetch("/aiapi/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

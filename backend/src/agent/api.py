@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -33,12 +32,7 @@ from agent.graph import stream_agent
 
 logger = logging.getLogger(__name__)
 
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_IMAGES = 8
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-DATA_URL_RE = re.compile(
-    r"^data:(image/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$"
-)
 IMAGE_PROMPT = "请识别这张图片。"
 
 
@@ -97,28 +91,47 @@ class ChatRequest(BaseModel):
 
 def _image_block(url: str) -> dict[str, object]:
     cleaned = url.strip()
+    if history.parse_image_id(cleaned) is not None:
+        raise ValueError("图片尚未载入")
     if cleaned.startswith(("http://", "https://")):
         if len(cleaned) > 8192:
             raise ValueError("图片链接过长")
         return {"type": "image_url", "image_url": {"url": cleaned}}
 
-    match = DATA_URL_RE.match(cleaned)
-    if not match:
+    decoded = history.decode_data_image(cleaned)
+    if decoded is None:
         raise ValueError("图片必须是 data URL 或 http(s) 链接")
-    mime = match.group(1).lower()
-    if mime == "image/jpg":
-        mime = "image/jpeg"
-    if mime not in ALLOWED_IMAGE_TYPES:
-        raise ValueError(f"不支持的图片格式：{mime}")
-    payload = re.sub(r"\s+", "", match.group(2))
-    if not payload:
-        raise ValueError("图片数据为空")
-    if len(payload) * 3 // 4 > MAX_IMAGE_BYTES:
-        raise ValueError("图片不能超过 8MB")
-    return {
-        "type": "image_url",
-        "image_url": {"url": f"data:{mime};base64,{payload}"},
-    }
+    mime, data = decoded
+    return {"type": "image_url", "image_url": {"url": history.data_url(mime, data)}}
+
+
+async def _messages_for_model(
+    messages: list[ChatMessage], session_id: str
+) -> list[ChatMessage]:
+    """Replace stored image URLs with data URLs before calling the model."""
+    prepared: list[ChatMessage] = []
+    for message in messages:
+        content = message.content
+        if not isinstance(content, list):
+            prepared.append(message)
+            continue
+        parts: list[ContentPart] = []
+        changed = False
+        for part in content:
+            if isinstance(part, ImagePart):
+                image_id = history.parse_image_id(part.image)
+                if image_id is not None:
+                    url = await history.image_data_url(image_id, session_id)
+                    if url is None:
+                        raise ValueError("图片不存在")
+                    parts.append(ImagePart(type="image", image=url))
+                    changed = True
+                    continue
+            parts.append(part)
+        prepared.append(
+            message.model_copy(update={"content": parts}) if changed else message
+        )
+    return prepared
 
 
 def _text_content(content: str | list[ContentPart]) -> str:
@@ -240,7 +253,25 @@ def transcript_of(
     return stored
 
 
-@app.get("/api/messages/{session_id}")
+@app.get("/aiapi/images/{image_id}")
+async def image(image_id: int) -> Response:
+    """Return one stored image."""
+    try:
+        found = await history.get_image(image_id)
+    except Exception as exc:
+        logger.exception("failed to load image")
+        raise HTTPException(status_code=503, detail="无法读取图片") from exc
+    if found is None:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    mime, data = found
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@app.get("/aiapi/messages/{session_id}")
 async def messages(session_id: str) -> dict[str, list[dict[str, object]]]:
     try:
         return {"messages": await history.list_messages(session_id)}
@@ -249,14 +280,14 @@ async def messages(session_id: str) -> dict[str, list[dict[str, object]]]:
         raise HTTPException(status_code=503, detail="无法读取会话消息记录") from exc
 
 
-@app.post("/api/chat")
+@app.post("/aiapi/chat")
 async def chat(body: ChatRequest) -> StreamingResponse:
     """Stream text and file proposals as NDJSON."""
     try:
-        messages = to_langchain(body.messages)
         session_id = body.session_id.strip()
         if not session_id:
             raise HTTPException(status_code=400, detail="缺少 session_id")
+        messages = to_langchain(await _messages_for_model(body.messages, session_id))
 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -300,7 +331,7 @@ async def chat(body: ChatRequest) -> StreamingResponse:
 
 
 
-@app.get("/api/sessions")
+@app.get("/aiapi/sessions")
 async def sessions() -> dict[str, list[dict[str, object]]]:
     try:
         return {"sessions": await history.list_sessions()}
@@ -308,7 +339,7 @@ async def sessions() -> dict[str, list[dict[str, object]]]:
         logger.exception("failed to load chat history")
         raise HTTPException(status_code=503, detail="无法读取会话记录") from exc
 
-@app.delete("/api/sessions/{session_id}")
+@app.delete("/aiapi/sessions/{session_id}")
 async def delete_sessions(session_id: str):
     try:
         await history.delete_session(session_id)

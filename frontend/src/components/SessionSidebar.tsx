@@ -25,7 +25,7 @@ export const SessionSidebar: FC<SessionSidebarProps> = ({
   onNew,
 }) => {
   return (
-    <ThreadListPrimitive.Root className="aui-root aui-thread-list-root bg-muted/30 flex h-full w-64 shrink-0 flex-col gap-1.5 border-r p-2">
+    <ThreadListPrimitive.Root className="aui-root aui-thread-list-root bg-muted/30 flex h-full w-full min-w-0 flex-col gap-1.5 overflow-x-hidden border-r p-2">
       {onNew && (
         <Button
           variant="ghost"
@@ -48,10 +48,10 @@ export const SessionSidebar: FC<SessionSidebarProps> = ({
               variant="ghost"
               aria-current={active ? "true" : undefined}
               data-active={active ? "" : undefined}
-              className="aui-thread-list-item hover:bg-muted data-active:bg-muted h-auto justify-start rounded-lg px-3 py-2 text-start font-normal"
+              className="aui-thread-list-item hover:bg-muted data-active:bg-muted h-auto w-full min-w-0 justify-start overflow-hidden rounded-lg px-3 py-2 text-start font-normal"
               onClick={() => onSelect(session.id)}
             >
-              <span className="truncate">{session.title || "新对话"}</span>
+              <span className="min-w-0 truncate">{session.title || "新对话"}</span>
             </Button>
           );
         })}

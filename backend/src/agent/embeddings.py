@@ -126,7 +126,7 @@ class EmbeddingModel:
         slug: str | None = None,
         faction_slug: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Embed a query and return the nearest stored chunks.
+        """Embed a query and blend vector similarity with keyword matches.
 
         Args:
             query: Natural-language query.
@@ -135,7 +135,7 @@ class EmbeddingModel:
             faction_slug: Restrict the search to one region.
 
         Returns:
-            Chunks ordered by cosine distance, closest first.
+            Chunks ordered by reciprocal rank fusion, closest agreement first.
         """
         if not query.strip():
             raise ValueError("查询文本不能为空")
@@ -143,6 +143,7 @@ class EmbeddingModel:
         return vectors.search_embeddings(
             embedding,
             limit,
+            query=query,
             slug=slug,
             faction_slug=faction_slug,
         )

@@ -227,7 +227,7 @@ async def skip_retrieve(state, config):
 
 
 async def retrieve(state, config):
-    """Embed the latest user message and store the nearest biographies."""
+    """Embed the latest user message and store the blended biographies."""
     del config
     query = latest_user_text(state.get("messages") or [])
     if not query:
