@@ -8,7 +8,17 @@ type ChatFilePart = {
   content: string;
   mime: string;
 };
-type ChatPart = ChatTextPart | ChatImagePart | ChatFilePart;
+export type ActivityName = "retrieve_lore" | "search_web";
+export type ActivityStatus = "running" | "complete" | "error";
+export type ChatActivityPart = {
+  type: "activity";
+  id: string;
+  name: ActivityName;
+  status: ActivityStatus;
+  title: string;
+  detail: string;
+};
+type ChatPart = ChatTextPart | ChatImagePart | ChatFilePart | ChatActivityPart;
 type ChatContent = string | ChatPart[];
 
 export type DownloadProposal = {
@@ -19,38 +29,133 @@ export type DownloadProposal = {
 
 export type ChatEvent =
   | { type: "text"; text: string }
-  | ({ type: "file" } & DownloadProposal);
+  | ({ type: "file" } & DownloadProposal)
+  | ChatActivityPart;
 
-const TOOL_NAME = "prepare_download";
+type ChatSegment =
+  | { kind: "text"; text: string }
+  | { kind: "file"; file: DownloadProposal }
+  | { kind: "activity"; activity: ChatActivityPart };
 
-export function assistantParts(text: string, files: readonly DownloadProposal[]) {
-  const content: Array<
-    | { type: "text"; text: string }
-    | {
-        type: "tool-call";
-        toolCallId: string;
-        toolName: typeof TOOL_NAME;
-        args: DownloadProposal;
-        argsText: string;
-        result: { ready: true };
-      }
-  > = [];
-  if (text) content.push({ type: "text", text });
-  files.forEach((file, index) => {
-    const args = {
-      filename: file.filename,
-      content: file.content,
-      mime: file.mime,
+const DOWNLOAD_TOOL = "prepare_download";
+
+type DownloadArgs = {
+  filename: string;
+  content: string;
+  mime: string;
+};
+
+type ActivityArgs = {
+  title: string;
+  detail: string;
+};
+
+type ToolCallPart =
+  | {
+      type: "tool-call";
+      toolCallId: string;
+      toolName: typeof DOWNLOAD_TOOL;
+      args: DownloadArgs;
+      argsText: string;
+      result: { ready: true };
+    }
+  | {
+      type: "tool-call";
+      toolCallId: string;
+      toolName: ActivityName;
+      args: ActivityArgs;
+      argsText: string;
+      result?: { title: string; detail: string; status: ActivityStatus };
+      isError?: boolean;
     };
-    content.push({
-      type: "tool-call",
-      toolCallId: `${TOOL_NAME}-${index}`,
-      toolName: TOOL_NAME,
-      args,
-      argsText: JSON.stringify(args),
-      result: { ready: true },
+
+type AssistantPart = { type: "text"; text: string } | ToolCallPart;
+
+const fileTool = (file: DownloadProposal, index: number): ToolCallPart => {
+  const args = {
+    filename: file.filename,
+    content: file.content,
+    mime: file.mime,
+  };
+  return {
+    type: "tool-call",
+    toolCallId: `${DOWNLOAD_TOOL}-${index}`,
+    toolName: DOWNLOAD_TOOL,
+    args,
+    argsText: file.filename,
+    result: { ready: true },
+  };
+};
+
+const activityTool = (activity: ChatActivityPart): ToolCallPart => {
+  const args = { title: activity.title, detail: activity.detail };
+  const part: ToolCallPart = {
+    type: "tool-call",
+    toolCallId: activity.id,
+    toolName: activity.name,
+    args,
+    argsText: activity.title,
+  };
+  if (activity.status === "running") return part;
+  return {
+    ...part,
+    isError: activity.status === "error",
+    result: {
+      title: activity.title,
+      detail: activity.detail,
+      status: activity.status,
+    },
+  };
+};
+
+export function applyChatEvent(segments: ChatSegment[], event: ChatEvent) {
+  if (event.type === "text") {
+    const last = segments[segments.length - 1];
+    if (last?.kind === "text") last.text += event.text;
+    else segments.push({ kind: "text", text: event.text });
+    return;
+  }
+  if (event.type === "file") {
+    segments.push({
+      kind: "file",
+      file: {
+        filename: event.filename,
+        content: event.content,
+        mime: event.mime,
+      },
     });
-  });
+    return;
+  }
+  const index = segments.findIndex(
+    (segment) => segment.kind === "activity" && segment.activity.id === event.id,
+  );
+  const activity: ChatActivityPart = {
+    type: "activity",
+    id: event.id,
+    name: event.name,
+    status: event.status,
+    title: event.title,
+    detail: event.detail,
+  };
+  if (index === -1) segments.push({ kind: "activity", activity });
+  else segments[index] = { kind: "activity", activity };
+}
+
+export function threadParts(segments: readonly ChatSegment[]): AssistantPart[] {
+  const content: AssistantPart[] = [];
+  let files = 0;
+  for (const segment of segments) {
+    if (segment.kind === "text") {
+      if (segment.text) content.push({ type: "text", text: segment.text });
+      continue;
+    }
+    if (segment.kind === "file") {
+      content.push(fileTool(segment.file, files));
+      files += 1;
+      continue;
+    }
+    content.push(activityTool(segment.activity));
+  }
   return content;
 }
 
@@ -84,31 +189,70 @@ const imagePartsOf = (message: ThreadMessage): ChatImagePart[] => {
   return images;
 };
 
-const downloadPartsOf = (message: ThreadMessage): ChatFilePart[] => {
-  if (message.role === "user") return [];
-  const files: ChatFilePart[] = [];
-  for (const part of message.content) {
-    if (part.type !== "tool-call" || part.toolName !== TOOL_NAME) continue;
-    const filename = part.args.filename;
-    const content = part.args.content;
-    const mime = part.args.mime;
-    if (typeof filename !== "string" || typeof content !== "string") continue;
-    files.push({
-      type: "file",
-      filename,
-      content,
-      mime: typeof mime === "string" ? mime : "text/plain",
-    });
-  }
-  return files;
+const stringOf = (value: unknown) => (typeof value === "string" ? value : "");
+
+const isActivityName = (name: string): name is ActivityName =>
+  name === "retrieve_lore" || name === "search_web";
+
+const activityPartOf = (
+  part: ThreadMessage["content"][number],
+): ChatActivityPart | null => {
+  if (part.type !== "tool-call" || !isActivityName(part.toolName)) return null;
+  const result =
+    part.result && typeof part.result === "object"
+      ? (part.result as { title?: unknown; detail?: unknown; status?: unknown })
+      : undefined;
+  const status: ActivityStatus =
+    part.isError || result?.status === "error"
+      ? "error"
+      : result
+        ? "complete"
+        : "running";
+  return {
+    type: "activity",
+    id: part.toolCallId,
+    name: part.toolName,
+    status,
+    title: stringOf(result?.title ?? part.args.title),
+    detail: stringOf(result?.detail ?? part.args.detail),
+  };
+};
+
+const filePartOf = (
+  part: ThreadMessage["content"][number],
+): ChatFilePart | null => {
+  if (part.type !== "tool-call" || part.toolName !== DOWNLOAD_TOOL) return null;
+  const filename = part.args.filename;
+  const content = part.args.content;
+  const mime = part.args.mime;
+  if (typeof filename !== "string" || typeof content !== "string") return null;
+  return {
+    type: "file",
+    filename,
+    content,
+    mime: typeof mime === "string" ? mime : "text/plain",
+  };
 };
 
 const contentOf = (message: ThreadMessage): ChatContent => {
   if (message.role !== "user") {
-    const text = textOf(message);
-    const files = downloadPartsOf(message);
-    if (files.length === 0) return text;
-    return [...(text ? [{ type: "text" as const, text }] : []), ...files];
+    const parts: ChatPart[] = [];
+    for (const part of message.content) {
+      if (part.type === "text") {
+        if (part.text) parts.push({ type: "text", text: part.text });
+        continue;
+      }
+      const activity = activityPartOf(part);
+      if (activity) {
+        parts.push(activity);
+        continue;
+      }
+      const file = filePartOf(part);
+      if (file) parts.push(file);
+    }
+    if (parts.length === 0) return "";
+    if (parts.length === 1 && parts[0].type === "text") return parts[0].text;
+    return parts;
   }
 
   const images = imagePartsOf(message);
@@ -156,6 +300,22 @@ const fileProposalOf = (part: ChatPart): DownloadProposal | null => {
   };
 };
 
+const storedActivityOf = (part: ChatPart): ChatActivityPart | null => {
+  if (part.type !== "activity" || !isActivityName(part.name)) return null;
+  if (part.status !== "running" && part.status !== "complete" && part.status !== "error") {
+    return null;
+  }
+  if (!part.id) return null;
+  return {
+    type: "activity",
+    id: part.id,
+    name: part.name,
+    status: part.status,
+    title: part.title || "",
+    detail: part.detail || "",
+  };
+};
+
 const normalizeHistoryContent = (
   content: ChatContent | undefined,
   role: HistoryMessage["role"],
@@ -164,16 +324,27 @@ const normalizeHistoryContent = (
   if (!Array.isArray(content)) return null;
 
   if (role !== "user") {
-    const text = content
-      .filter((part) => part.type === "text")
-      .map((part) => part.text)
-      .join("");
-    const files = content.flatMap((part) => {
+    const parts: AssistantPart[] = [];
+    let files = 0;
+    for (const part of content) {
+      if (part.type === "text") {
+        if (part.text) parts.push({ type: "text", text: part.text });
+        continue;
+      }
+      const activity = storedActivityOf(part);
+      if (activity) {
+        parts.push(activityTool(activity));
+        continue;
+      }
       const file = fileProposalOf(part);
-      return file ? [file] : [];
-    });
-    if (files.length === 0) return text;
-    return assistantParts(text, files);
+      if (file) {
+        parts.push(fileTool(file, files));
+        files += 1;
+      }
+    }
+    if (parts.length === 0) return "";
+    if (parts.length === 1 && parts[0].type === "text") return parts[0].text;
+    return parts;
   }
 
   const parts: Array<
@@ -223,6 +394,47 @@ export async function loadMessages(sessionId: string): Promise<ThreadMessageLike
   });
 }
 
+const chatEvent = (value: unknown): ChatEvent | null => {
+  if (!value || typeof value !== "object") return null;
+  const event = value as Record<string, unknown>;
+  if (event.type === "text" && typeof event.text === "string") {
+    return { type: "text", text: event.text };
+  }
+  if (
+    event.type === "file" &&
+    typeof event.filename === "string" &&
+    typeof event.content === "string"
+  ) {
+    return {
+      type: "file",
+      filename: event.filename,
+      content: event.content,
+      mime: typeof event.mime === "string" ? event.mime : "text/plain",
+    };
+  }
+  if (
+    event.type === "activity" &&
+    typeof event.id === "string" &&
+    typeof event.name === "string" &&
+    isActivityName(event.name) &&
+    (event.status === "running" ||
+      event.status === "complete" ||
+      event.status === "error") &&
+    typeof event.title === "string" &&
+    typeof event.detail === "string"
+  ) {
+    return {
+      type: "activity",
+      id: event.id,
+      name: event.name,
+      status: event.status,
+      title: event.title,
+      detail: event.detail,
+    };
+  }
+  return null;
+};
+
 export async function* streamChat(
   sessionId: string,
   messages: readonly ThreadMessage[],
@@ -255,10 +467,14 @@ export async function* streamChat(
     buffer = done ? "" : (lines.pop() ?? "");
     for (const line of lines) {
       if (!line.trim()) continue;
-      yield JSON.parse(line) as ChatEvent;
+      const event = chatEvent(JSON.parse(line));
+      if (event) yield event;
     }
     if (done) {
-      if (buffer.trim()) yield JSON.parse(buffer) as ChatEvent;
+      if (buffer.trim()) {
+        const event = chatEvent(JSON.parse(buffer));
+        if (event) yield event;
+      }
       break;
     }
   }

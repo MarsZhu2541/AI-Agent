@@ -15,6 +15,16 @@ from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel
 
+from .activity import (
+    lore_failed,
+    lore_found,
+    lore_missed,
+    lore_running,
+    publish_activity,
+    search_finished,
+    search_running,
+    search_unfinished,
+)
 from .embeddings import embedding_model
 from .state import AgentState
 from .tools import tools
@@ -232,11 +242,17 @@ async def retrieve(state, config):
     query = latest_user_text(state.get("messages") or [])
     if not query:
         return {"lore_context": ""}
+    publish_activity(lore_running(query))
     try:
         hits = await asyncio.to_thread(embedding_model.search, query, LORE_LIMIT)
     except Exception:
         logger.exception("lore retrieval failed")
+        publish_activity(lore_failed())
         return {"lore_context": ""}
+    if not hits:
+        publish_activity(lore_missed())
+        return {"lore_context": ""}
+    publish_activity(lore_found(hits))
     return {"lore_context": format_lore(hits)}
 
 
@@ -266,9 +282,57 @@ def trim_messages_node(state, config):
     return {"messages": [RemoveMessage(id=m.id) for m in to_remove]}
 
 
-async def run_tools(input, config, **kwargs):
-    tool_node = ToolNode(get_tools(config))
-    return await tool_node.ainvoke(input, config, **kwargs)
+def search_calls(state) -> list[dict[str, Any]]:
+    """Return web-search tool calls on the latest model message."""
+    messages = state.get("messages") or []
+    if not messages:
+        return []
+    calls = getattr(messages[-1], "tool_calls", None) or []
+    return [
+        call
+        for call in calls
+        if isinstance(call, dict) and call.get("name") == "search_web"
+    ]
+
+
+def search_call_query(call: dict[str, Any]) -> str:
+    """Return the query argument of one web-search call."""
+    args = call.get("args") or {}
+    if not isinstance(args, dict):
+        return ""
+    return str(args.get("query") or "").strip()
+
+
+async def run_tools(state, config, **kwargs):
+    """Run tool calls and publish web-search progress for the chat UI."""
+    queries: dict[str, str] = {}
+    for index, call in enumerate(search_calls(state)):
+        identifier = str(call.get("id") or "").strip() or f"search_web-{index}"
+        query = search_call_query(call)
+        queries[identifier] = query
+        publish_activity(search_running(identifier, query))
+    try:
+        result = await ToolNode(get_tools(config)).ainvoke(state, config, **kwargs)
+    except Exception:
+        for identifier, query in queries.items():
+            publish_activity(search_unfinished(identifier, query))
+        raise
+    finished: set[str] = set()
+    messages = result.get("messages") if isinstance(result, dict) else None
+    for message in messages or []:
+        if getattr(message, "name", None) != "search_web":
+            continue
+        identifier = str(getattr(message, "tool_call_id", "") or "")
+        if identifier not in queries:
+            continue
+        finished.add(identifier)
+        publish_activity(
+            search_finished(identifier, queries[identifier], message_text(message))
+        )
+    for identifier, query in queries.items():
+        if identifier not in finished:
+            publish_activity(search_unfinished(identifier, query))
+    return result
 
 
 workflow = StateGraph(AgentState)
@@ -286,15 +350,44 @@ workflow.add_edge("agent", "trim")
 workflow.add_conditional_edges("trim", should_continue, ["tools", END])
 workflow.add_edge("tools", "agent")
 
-graph = workflow.compile(checkpointer=InMemorySaver())
+# LangGraph API injects its own checkpointer. A custom one fails `langgraph dev`.
+graph = workflow.compile()
+# The HTTP API keeps its own in-process memory, keyed by session_id.
+_api_graph = workflow.compile(checkpointer=InMemorySaver())
 
 
 async def run_agent(input, config=None, **kwargs):
     """Non-streaming entry: guarantees thread_id."""
-    return await graph.ainvoke(input, with_thread_id(config), **kwargs)
+    return await _api_graph.ainvoke(input, with_thread_id(config), **kwargs)
+
+
+def stream_part(item: object) -> tuple[str, object] | None:
+    """Return ``(mode, payload)`` for one multi-mode graph event."""
+    if not isinstance(item, tuple):
+        return None
+    if len(item) == 2 and isinstance(item[0], str):
+        return item[0], item[1]
+    if len(item) == 3 and isinstance(item[1], str):
+        return item[1], item[2]
+    return None
 
 
 async def stream_agent(input, config=None, **kwargs):
-    """Streaming entry: guarantees thread_id for checkpointer."""
-    async for item in graph.astream(input, with_thread_id(config), **kwargs):
-        yield item
+    """Stream answer tokens and activity events for one turn."""
+    kwargs.pop("stream_mode", None)
+    async for item in _api_graph.astream(
+        input,
+        with_thread_id(config),
+        stream_mode=["messages", "custom"],
+        **kwargs,
+    ):
+        part = stream_part(item)
+        if part is None:
+            continue
+        mode, payload = part
+        if mode == "custom":
+            if isinstance(payload, dict) and payload.get("type") == "activity":
+                yield payload
+            continue
+        if mode == "messages":
+            yield payload

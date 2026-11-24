@@ -21,6 +21,7 @@ from langchain_core.messages import (
 from pydantic import BaseModel, Field
 
 from agent import history
+from agent.activity import activity_for_history, stream_activity
 from agent.downloads import (
     PreparedFile,
     bind_prepared_files,
@@ -76,7 +77,19 @@ class FilePart(BaseModel):
     mime: str = "text/plain"
 
 
-ContentPart = Annotated[TextPart | ImagePart | FilePart, Field(discriminator="type")]
+class ActivityPart(BaseModel):
+    type: Literal["activity"]
+    id: str = Field(min_length=1, max_length=80)
+    name: Literal["retrieve_lore", "search_web"]
+    status: Literal["running", "complete", "error"]
+    title: str = Field(default="", max_length=200)
+    detail: str = Field(default="", max_length=4000)
+
+
+ContentPart = Annotated[
+    TextPart | ImagePart | FilePart | ActivityPart,
+    Field(discriminator="type"),
+]
 
 
 class ChatMessage(BaseModel):
@@ -147,7 +160,7 @@ def _user_content(content: str | list[ContentPart]) -> str | list[dict[str, obje
     blocks: list[dict[str, object]] = []
     images = 0
     for part in content:
-        if isinstance(part, FilePart):
+        if isinstance(part, (FilePart, ActivityPart)):
             continue
         if isinstance(part, TextPart):
             if part.text:
@@ -212,6 +225,11 @@ def _stored_content(content: Any) -> Any:
         return content
     kept: list[Any] = []
     for part in content:
+        if isinstance(part, dict) and part.get("type") == "activity":
+            stored = activity_for_history(part)
+            if stored:
+                kept.append(stored)
+            continue
         if not isinstance(part, dict) or part.get("type") != "file":
             kept.append(part)
             continue
@@ -230,10 +248,15 @@ def _event(payload: dict[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
 
 
+_UNSET = object()
+
+
 def transcript_of(
     body: ChatRequest,
-    reply: str,
+    reply: str = "",
     files: list[PreparedFile] | None = None,
+    *,
+    assistant: Any = _UNSET,
 ) -> list[dict[str, object]]:
     """Build the full thread to store, including the finished reply and files."""
     stored: list[dict[str, object]] = []
@@ -241,6 +264,10 @@ def transcript_of(
         item = message.model_dump()
         item["content"] = _stored_content(item["content"])
         stored.append(item)
+    if assistant is not _UNSET:
+        if assistant:
+            stored.append({"role": "assistant", "content": assistant})
+        return stored
     prepared = list(files or [])
     if prepared:
         parts: list[dict[str, str]] = []
@@ -251,6 +278,55 @@ def transcript_of(
     elif reply:
         stored.append({"role": "assistant", "content": reply})
     return stored
+
+
+def _append_text(segments: list[dict[str, Any]], text: str) -> None:
+    """Append text onto the trailing text segment."""
+    if (
+        segments
+        and segments[-1].get("type") == "text"
+        and isinstance(segments[-1].get("text"), str)
+    ):
+        segments[-1]["text"] = str(segments[-1]["text"]) + text
+        return
+    segments.append({"type": "text", "text": text})
+
+
+def _upsert_activity(segments: list[dict[str, Any]], event: dict[str, str]) -> None:
+    """Insert an activity or replace the earlier event with the same id."""
+    for index, segment in enumerate(segments):
+        if segment.get("type") == "activity" and segment.get("id") == event["id"]:
+            segments[index] = event
+            return
+    segments.append(event)
+
+
+def _has_file(segments: list[dict[str, Any]]) -> bool:
+    return any(segment.get("type") == "file" for segment in segments)
+
+
+def _has_text(segments: list[dict[str, Any]]) -> bool:
+    return any(
+        segment.get("type") == "text" and str(segment.get("text") or "").strip()
+        for segment in segments
+    )
+
+
+def _assistant_content(segments: list[dict[str, Any]]) -> str | list[dict[str, Any]] | None:
+    """Return the assistant message to store, with unfinished steps marked failed."""
+    settled: list[dict[str, Any]] = []
+    for segment in segments:
+        if segment.get("type") == "activity":
+            stored = activity_for_history(segment)
+            if stored:
+                settled.append(stored)
+            continue
+        settled.append(segment)
+    if not settled:
+        return None
+    if len(settled) == 1 and settled[0].get("type") == "text":
+        return str(settled[0].get("text") or "")
+    return settled
 
 
 @app.get("/aiapi/images/{image_id}")
@@ -282,7 +358,7 @@ async def messages(session_id: str) -> dict[str, list[dict[str, object]]]:
 
 @app.post("/aiapi/chat")
 async def chat(body: ChatRequest) -> StreamingResponse:
-    """Stream text and file proposals as NDJSON."""
+    """Stream text, activity steps, and file proposals as NDJSON."""
     try:
         session_id = body.session_id.strip()
         if not session_id:
@@ -293,8 +369,7 @@ async def chat(body: ChatRequest) -> StreamingResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def stream() -> AsyncIterator[str]:
-        parts: list[str] = []
-        files: list[PreparedFile] = []
+        segments: list[dict[str, Any]] = []
         token = bind_prepared_files()
         try:
             async for item in stream_agent(
@@ -303,27 +378,34 @@ async def chat(body: ChatRequest) -> StreamingResponse:
                 stream_mode="messages",
             ):
                 for prepared in take_prepared_files():
-                    files.append(prepared)
-                    yield _event({"type": "file", **prepared.as_part()})
+                    segments.append(prepared.as_part())
+                    yield _event(prepared.as_part())
+                activity = stream_activity(item)
+                if activity is not None:
+                    _upsert_activity(segments, activity)
+                    yield _event(activity)
+                    continue
                 text = agent_reply_text(item)
                 if text:
-                    parts.append(text)
+                    _append_text(segments, text)
                     yield _event({"type": "text", "text": text})
             for prepared in take_prepared_files():
-                files.append(prepared)
-                yield _event({"type": "file", **prepared.as_part()})
-            reply = "".join(parts)
-            if files and not reply:
-                reply = "文件已生成，确认后即可下载。"
-                parts.append(reply)
-                yield _event({"type": "text", "text": reply})
+                segments.append(prepared.as_part())
+                yield _event(prepared.as_part())
+            if _has_file(segments) and not _has_text(segments):
+                note = "文件已生成，确认后即可下载。"
+                _append_text(segments, note)
+                yield _event({"type": "text", "text": note})
         finally:
             reset_prepared_files(token)
 
         if not body.messages:
             return
         try:
-            await history.replace_messages(transcript_of(body, "".join(parts), files), session_id)
+            await history.replace_messages(
+                transcript_of(body, assistant=_assistant_content(segments)),
+                session_id,
+            )
         except Exception:
             logger.exception("failed to save chat history")
     

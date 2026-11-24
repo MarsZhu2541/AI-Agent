@@ -1,13 +1,17 @@
+import {
+  LoreActivityToolUI,
+  SearchActivityToolUI,
+} from "@/components/ActivityTool";
 import { DownloadFileToolUI } from "@/components/DownloadFile";
 import { SessionSidebar, type ChatSession } from "@/components/SessionSidebar";
 import { Thread } from "@/components/assistant-ui/elements/thread.aui";
 import { Button } from "@/components/ui/button";
 import {
-  assistantParts,
+  applyChatEvent,
   loadMessages,
   loadSessions,
   streamChat,
-  type DownloadProposal,
+  threadParts,
 } from "@/lib/chatApi";
 import { ImageAttachmentAdapter } from "@/lib/imageAttachment";
 import { createSessionId } from "@/lib/sessionId";
@@ -73,16 +77,30 @@ function AssistantThread({
   const [chatModel] = useState<ChatModelAdapter>(() => ({
     async *run({ messages, abortSignal }) {
       onSendRef.current(sessionRef.current, sessionTitle(messages));
-      let text = "";
-      const files: DownloadProposal[] = [];
+      const segments: Parameters<typeof applyChatEvent>[0] = [];
       for await (const event of streamChat(
         sessionRef.current,
         messages,
         abortSignal,
       )) {
-        if (event.type === "text") text += event.text;
-        else files.push(event);
-        const content = assistantParts(text, files);
+        applyChatEvent(segments, event);
+        const content = threadParts(segments);
+        if (content.length > 0) yield { content };
+      }
+      let unfinished = false;
+      for (const segment of segments) {
+        if (segment.kind !== "activity" || segment.activity.status !== "running") {
+          continue;
+        }
+        unfinished = true;
+        segment.activity = {
+          ...segment.activity,
+          status: "error",
+          detail: segment.activity.detail || "未完成",
+        };
+      }
+      if (unfinished) {
+        const content = threadParts(segments);
         if (content.length > 0) yield { content };
       }
     },
@@ -96,6 +114,8 @@ function AssistantThread({
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <DownloadFileToolUI />
+      <LoreActivityToolUI />
+      <SearchActivityToolUI />
       <div className="h-full min-h-0 min-w-0 flex-1">
         <Thread />
       </div>

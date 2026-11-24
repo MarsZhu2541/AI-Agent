@@ -328,13 +328,13 @@ def test_chat_streams_a_file_for_confirmation(
         }
     ]
     assert memory_history[1]["content"] == [
-        {"type": "text", "text": "请确认下载"},
         {
             "type": "file",
             "filename": "note.txt",
             "content": "hello",
             "mime": "text/plain",
         },
+        {"type": "text", "text": "请确认下载"},
     ]
 
 
@@ -400,3 +400,95 @@ def test_chat_resolves_stored_image_urls(monkeypatch) -> None:
         .content[1]["image_url"]["url"]
         .startswith("data:image/png;base64,")
     )
+
+
+LORE_ACTIVITY = {
+    "type": "activity",
+    "id": "retrieve_lore",
+    "name": "retrieve_lore",
+    "status": "complete",
+    "title": "检索到 亚索（疾风剑豪）",
+    "detail": "亚索（疾风剑豪）\n他追着风走。",
+}
+
+
+def test_chat_streams_activity_and_keeps_the_final_step(
+    memory_history: list[dict], monkeypatch
+) -> None:
+    async def fake_stream(*_args, **_kwargs):
+        yield {
+            **LORE_ACTIVITY,
+            "status": "running",
+            "title": "正在检索英雄传记：亚索是谁",
+            "detail": "",
+        }
+        yield LORE_ACTIVITY
+        yield (AIMessageChunk(content="亚索追着风走。"), {"langgraph_node": "agent"})
+
+    monkeypatch.setattr("agent.api.stream_agent", fake_stream)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/aiapi/chat",
+            json=_chat_body([{"role": "user", "content": "亚索是谁"}]),
+        )
+
+    events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+    assert response.status_code == 200
+    assert [event["type"] for event in events] == ["activity", "activity", "text"]
+    assert events[0]["status"] == "running"
+    assert events[1] == LORE_ACTIVITY
+    assert memory_history[1]["content"] == [
+        LORE_ACTIVITY,
+        {"type": "text", "text": "亚索追着风走。"},
+    ]
+
+
+def test_chat_marks_a_step_that_never_finishes(
+    memory_history: list[dict], monkeypatch
+) -> None:
+    async def fake_stream(*_args, **_kwargs):
+        yield {
+            "type": "activity",
+            "id": "call_weather",
+            "name": "search_web",
+            "status": "running",
+            "title": "正在搜索：杭州天气",
+            "detail": "",
+        }
+
+    monkeypatch.setattr("agent.api.stream_agent", fake_stream)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/aiapi/chat",
+            json=_chat_body([{"role": "user", "content": "杭州天气"}]),
+        )
+
+    assert response.status_code == 200
+    assert memory_history[1]["content"] == [
+        {
+            "type": "activity",
+            "id": "call_weather",
+            "name": "search_web",
+            "status": "error",
+            "title": "正在搜索：杭州天气",
+            "detail": "未完成",
+        }
+    ]
+
+
+def test_to_langchain_skips_activity_parts() -> None:
+    messages = _convert(
+        [
+            {
+                "role": "assistant",
+                "content": [
+                    LORE_ACTIVITY,
+                    {"type": "text", "text": "亚索追着风走。"},
+                ],
+            }
+        ]
+    )
+
+    assert messages[0].content == "亚索追着风走。"
