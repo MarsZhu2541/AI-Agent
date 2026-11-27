@@ -80,3 +80,9 @@ export const SearchActivityToolUI = makeAssistantToolUI<ActivityArgs, ActivityRe
   display: "standalone",
   render: renderActivity,
 });
+
+export const WeatherActivityToolUI = makeAssistantToolUI<ActivityArgs, ActivityResult>({
+  toolName: "get_weather",
+  display: "standalone",
+  render: renderActivity,
+});

@@ -9,10 +9,11 @@ from langgraph.config import get_stream_writer
 
 MAX_TITLE = 200
 MAX_DETAIL = 4000
-ACTIVITY_NAMES = frozenset({"retrieve_lore", "search_web"})
+ACTIVITY_NAMES = frozenset({"retrieve_lore", "search_web", "get_weather"})
 ACTIVITY_STATUSES = frozenset({"running", "complete", "error"})
 _ID = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _SEARCH_FAILURES = ("联网搜索失败", "联网搜索未配置")
+_WEATHER_FAILURES = ("未能获取", "未找到地区", "搜索关键词为空")
 
 
 def clip(value: object, limit: int) -> str:
@@ -102,14 +103,14 @@ def activity_for_history(payload: object) -> dict[str, str] | None:
 def lore_running(query: str) -> dict[str, str]:
     """Describe a biography search that has started."""
     short = one_line(query, 40)
-    title = f"正在检索英雄传记：{short}" if short else "正在检索英雄传记"
+    title = f"正在检索资料：{short}" if short else "正在检索资料"
     return make_activity("retrieve_lore", "retrieve_lore", "running", title, "")
 
 
 def lore_found(hits: list[dict[str, Any]]) -> dict[str, str]:
     """Describe the biographies a search returned."""
     labels = [_hit_label(hit) for hit in hits[:4]]
-    title = f"检索到 {'、'.join(labels)}" if labels else "检索到相关传记"
+    title = f"检索到 {'、'.join(labels)}" if labels else "检索到相关资料"
     if len(hits) > len(labels):
         title = f"{title} 等 {len(hits)} 篇"
     return make_activity(
@@ -127,7 +128,7 @@ def lore_missed() -> dict[str, str]:
         "retrieve_lore",
         "retrieve_lore",
         "complete",
-        "没有检索到相关传记",
+        "没有检索到相关资料",
         "",
     )
 
@@ -138,7 +139,7 @@ def lore_failed() -> dict[str, str]:
         "retrieve_lore",
         "retrieve_lore",
         "error",
-        "英雄传记检索失败",
+        "资料检索失败",
         "检索没有完成",
     )
 
@@ -167,12 +168,36 @@ def search_unfinished(identifier: str, query: str) -> dict[str, str]:
     return make_activity(identifier, "search_web", "error", title, "搜索没有完成")
 
 
+def weather_running(identifier: str, query: str) -> dict[str, str]:
+    """Describe a weather lookup that has started."""
+    title = f"正在查询天气：{query}" if query else "正在查询天气"
+    return make_activity(identifier, "get_weather", "running", title, "")
+
+
+def weather_finished(identifier: str, query: str, body: str) -> dict[str, str]:
+    """Describe a finished weather lookup, including a failed lookup."""
+    failed = body.startswith(_WEATHER_FAILURES)
+    if failed:
+        title = f"天气查询失败：{query}" if query else "天气查询失败"
+        status = "error"
+    else:
+        title = f"已查询天气：{query}" if query else "已查询天气"
+        status = "complete"
+    return make_activity(identifier, "get_weather", status, title, body)
+
+
+def weather_unfinished(identifier: str, query: str) -> dict[str, str]:
+    """Describe a weather lookup that stopped before returning a forecast."""
+    title = f"天气查询失败：{query}" if query else "天气查询失败"
+    return make_activity(identifier, "get_weather", "error", title, "天气查询没有完成")
+
+
 def _hit_label(hit: dict[str, Any]) -> str:
     name = str(hit.get("name") or "").strip()
     title = str(hit.get("title") or "").strip()
     if name and title:
         return f"{name}（{title}）"
-    return name or title or str(hit.get("id") or "传记")
+    return name or title or str(hit.get("id") or "资料")
 
 
 def _lore_detail(hits: list[dict[str, Any]]) -> str:

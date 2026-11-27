@@ -68,7 +68,7 @@ async def test_stream_reports_retrieved_champions(monkeypatch: pytest.MonkeyPatc
     activities = _activities(events)
     assert [item["status"] for item in activities] == ["running", "complete"]
     assert activities[0]["name"] == "retrieve_lore"
-    assert activities[0]["title"].startswith("正在检索英雄传记")
+    assert activities[0]["title"].startswith("正在检索资料")
     assert activities[1]["title"] == "检索到 亚索（疾风剑豪）"
     assert "他追着风走。" in activities[1]["detail"]
 

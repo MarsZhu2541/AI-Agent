@@ -8,7 +8,7 @@ type ChatFilePart = {
   content: string;
   mime: string;
 };
-export type ActivityName = "retrieve_lore" | "search_web";
+export type ActivityName = "retrieve_lore" | "search_web" | "get_weather";
 export type ActivityStatus = "running" | "complete" | "error";
 export type ChatActivityPart = {
   type: "activity";
@@ -192,7 +192,7 @@ const imagePartsOf = (message: ThreadMessage): ChatImagePart[] => {
 const stringOf = (value: unknown) => (typeof value === "string" ? value : "");
 
 const isActivityName = (name: string): name is ActivityName =>
-  name === "retrieve_lore" || name === "search_web";
+  name === "retrieve_lore" || name === "search_web" || name === "get_weather";
 
 const activityPartOf = (
   part: ThreadMessage["content"][number],
@@ -437,14 +437,18 @@ const chatEvent = (value: unknown): ChatEvent | null => {
 
 export async function* streamChat(
   sessionId: string,
+  userIp: string,
   messages: readonly ThreadMessage[],
   signal: AbortSignal,
+  outfitChat: boolean
 ): AsyncGenerator<ChatEvent> {
-  const response = await fetch("/aiapi/chat", {
+  const path = outfitChat ? "/aiapi/outfit/chat" : "/aiapi/chat";
+  const response = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       session_id: sessionId,
+      user_ip: userIp,
       messages: messages.map((message) => ({
         role: message.role,
         content: contentOf(message),

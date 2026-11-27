@@ -30,6 +30,7 @@ from agent.downloads import (
     take_prepared_files,
 )
 from agent.graph import stream_agent
+from agent.outfit.outfit_graph import outfit_stream_agent
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ class FilePart(BaseModel):
 class ActivityPart(BaseModel):
     type: Literal["activity"]
     id: str = Field(min_length=1, max_length=80)
-    name: Literal["retrieve_lore", "search_web"]
+    name: Literal["retrieve_lore", "search_web", "get_weather"]
     status: Literal["running", "complete", "error"]
     title: str = Field(default="", max_length=200)
     detail: str = Field(default="", max_length=4000)
@@ -99,6 +100,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     session_id: str
+    user_ip: str
     messages: list[ChatMessage] = Field(default_factory=list)
 
 
@@ -153,8 +155,10 @@ def _text_content(content: str | list[ContentPart]) -> str:
     return "".join(part.text for part in content if isinstance(part, TextPart))
 
 
-def _user_content(content: str | list[ContentPart]) -> str | list[dict[str, object]]:
+def _user_content(content: str | list[ContentPart], user_ip: str, if_add_ip:bool) -> str | list[dict[str, object]]:
     if isinstance(content, str):
+        if if_add_ip:
+            return content + "我的ip地址是： "+ user_ip
         return content
 
     blocks: list[dict[str, object]] = []
@@ -182,7 +186,7 @@ def _user_content(content: str | list[ContentPart]) -> str | list[dict[str, obje
     return blocks
 
 
-def to_langchain(messages: list[ChatMessage]) -> list[BaseMessage]:
+def to_langchain(messages: list[ChatMessage], user_ip: str, if_add_ip: bool) -> list[BaseMessage]:
     converted: list[BaseMessage] = []
     for message in messages:
         if message.role == "assistant":
@@ -190,7 +194,7 @@ def to_langchain(messages: list[ChatMessage]) -> list[BaseMessage]:
         elif message.role == "system":
             converted.append(SystemMessage(content=_text_content(message.content)))
         else:
-            converted.append(HumanMessage(content=_user_content(message.content)))
+            converted.append(HumanMessage(content=_user_content(message.content, user_ip, if_add_ip)))
     return converted
 
 
@@ -363,7 +367,8 @@ async def chat(body: ChatRequest) -> StreamingResponse:
         session_id = body.session_id.strip()
         if not session_id:
             raise HTTPException(status_code=400, detail="缺少 session_id")
-        messages = to_langchain(await _messages_for_model(body.messages, session_id))
+        user_ip = body.user_ip.strip()
+        messages = to_langchain(await _messages_for_model(body.messages, session_id),  user_ip, False)
 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -428,3 +433,47 @@ async def delete_sessions(session_id: str):
     except Exception as exc:
         logger.exception("failed to delete session")
         raise HTTPException(status_code=503, detail="无法读取消息记录") from exc
+
+
+@app.post("/aiapi/outfit/chat")
+async def outfit_chat(body: ChatRequest) -> StreamingResponse:
+    """Stream text, activity steps, and file proposals as NDJSON."""
+    try:
+        session_id = body.session_id.strip()
+        if not session_id:
+            raise HTTPException(status_code=400, detail="缺少 session_id")
+        messages = to_langchain(await _messages_for_model(body.messages, session_id), body.user_ip, True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    async def stream() -> AsyncIterator[str]:
+        segments: list[dict[str, Any]] = []
+        try:
+            async for item in outfit_stream_agent(
+                    {"messages": messages},
+                    {"configurable": {"session_id": session_id}},
+                    stream_mode="messages",
+            ):
+                activity = stream_activity(item)
+                if activity is not None:
+                    _upsert_activity(segments, activity)
+                    yield _event(activity)
+                    continue
+                text = agent_reply_text(item)
+                if text:
+                    _append_text(segments, text)
+                    yield _event({"type": "text", "text": text})
+        except Exception:
+            logger.exception("outfit stream failed")
+            return
+
+        if not body.messages:
+            return
+        try:
+            await history.replace_messages(
+                transcript_of(body, assistant=_assistant_content(segments)),
+                session_id,
+            )
+        except Exception:
+            logger.exception("failed to save chat history")
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson; charset=utf-8")

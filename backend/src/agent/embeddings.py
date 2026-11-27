@@ -148,5 +148,35 @@ class EmbeddingModel:
             faction_slug=faction_slug,
         )
 
+    def outfit_search(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        slug: str | None = None,
+        faction_slug: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Embed a query and blend vector similarity with keyword matches.
+
+        Args:
+            query: Natural-language query.
+            limit: Maximum number of chunks to return.
+            slug: Restrict the search to one champion.
+            faction_slug: Restrict the search to one region.
+
+        Returns:
+            Chunks ordered by reciprocal rank fusion, closest agreement first.
+        """
+        if not query.strip():
+            raise ValueError("查询文本不能为空")
+        embedding = self.embed(query)[0]
+        return vectors.outfit_search_embeddings(
+            embedding,
+            limit,
+            query=query,
+            slug=slug,
+            faction_slug=faction_slug,
+        )
+
 
 embedding_model = EmbeddingModel()

@@ -160,7 +160,7 @@ def format_lore(hits: list[dict[str, Any]]) -> str:
     """Format retrieved biographies for the system prompt."""
     if not hits:
         return ""
-    blocks = ["检索到的英雄传记片段："]
+    blocks = ["检索到的片段："]
     for index, hit in enumerate(hits, start=1):
         name = str(hit.get("name") or "")
         title = str(hit.get("title") or "")

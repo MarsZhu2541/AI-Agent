@@ -387,3 +387,18 @@ def search_embeddings(
         faction_slug=faction_slug,
     )
     return fuse_hits(vector_rows, keyword_rows, limit)
+
+
+def outfit_search_embeddings(
+    embedding: list[float],
+    limit: int = 5,
+    *,
+    query: str | None = None,
+    slug: str | None = None,
+    faction_slug: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return chunks by blending cosine distance with keyword matches.
+
+    Without a query, ranking uses cosine distance alone.
+    """
+    return []

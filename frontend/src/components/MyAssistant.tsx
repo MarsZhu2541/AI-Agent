@@ -1,6 +1,7 @@
 import {
   LoreActivityToolUI,
   SearchActivityToolUI,
+  WeatherActivityToolUI,
 } from "@/components/ActivityTool";
 import { DownloadFileToolUI } from "@/components/DownloadFile";
 import { SessionSidebar, type ChatSession } from "@/components/SessionSidebar";
@@ -24,7 +25,7 @@ import {
   type ThreadMessageLike,
 } from "@assistant-ui/react";
 import { PanelLeftIcon } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const NARROW_VIEWPORT = "(max-width: 767px)";
 
@@ -60,28 +61,60 @@ function sessionTitle(messages: readonly ThreadMessage[]): string {
 
 function AssistantThread({
   sessionId,
-  initialMessages,
+  initialMessages, outfitChat, setOutfitChat,userIp,
   onSend,
 }: {
   sessionId: string;
   initialMessages: ThreadMessageLike[];
+  outfitChat: boolean;
+  setOutfitChat: (value: boolean) => void;
+  userIp: string;
   onSend: (sessionId: string, title: string) => void;
 }) {
   const sessionRef = useRef(sessionId);
   const onSendRef = useRef(onSend);
+  const outfitChatRef = useRef(outfitChat);
+  const userIpRef = useRef(userIp);
   useEffect(() => {
+    outfitChatRef.current = outfitChat;
+    userIpRef.current = userIp
     sessionRef.current = sessionId;
     onSendRef.current = onSend;
   });
 
+  const ComposerExtra = useMemo(() => {
+    function OutfitToggle() {
+      return (
+        <Button
+          type="button"
+          size="sm"
+          aria-label="穿搭推荐"
+          aria-pressed={outfitChat}
+          variant={outfitChat ? "default" : "ghost"}
+          className={cn(
+            "h-7 rounded-full px-2.5 text-xs",
+            !outfitChat && "border-border text-muted-foreground",
+          )}
+          onClick={() => setOutfitChat(!outfitChat)}
+        >
+          穿搭推荐
+        </Button>
+      );
+    }
+    return OutfitToggle;
+  }, [outfitChat, setOutfitChat]);
+
+
   const [chatModel] = useState<ChatModelAdapter>(() => ({
     async *run({ messages, abortSignal }) {
-      onSendRef.current(sessionRef.current, sessionTitle(messages));
+      onSendRef.current(sessionRef.current, sessionTitle(messages), );
       const segments: Parameters<typeof applyChatEvent>[0] = [];
       for await (const event of streamChat(
         sessionRef.current,
+        userIpRef.current,
         messages,
         abortSignal,
+        outfitChatRef.current,
       )) {
         applyChatEvent(segments, event);
         const content = threadParts(segments);
@@ -116,8 +149,9 @@ function AssistantThread({
       <DownloadFileToolUI />
       <LoreActivityToolUI />
       <SearchActivityToolUI />
+      <WeatherActivityToolUI />
       <div className="h-full min-h-0 min-w-0 flex-1">
-        <Thread />
+        <Thread components={{ ComposerExtra }}  />
       </div>
     </AssistantRuntimeProvider>
   );
@@ -131,7 +165,9 @@ export function MyAssistant() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [outfitChat, setOutfitChat] = useState(false);
   const narrow = useNarrowViewport();
+  const [userIp, setUserIp] = useState("");
 
   useEffect(() => {
     if (!narrow || !sidebarOpen) return;
@@ -154,6 +190,29 @@ export function MyAssistant() {
       return [next, ...current.filter((session) => session.id !== id)];
     });
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    console.log("start query user ip: ")
+
+    async function fetchIp() {
+      try {
+        const ipRes = await fetch("http://ip-api.com/json/?lang=zh-CN");
+        if (!ipRes.ok) throw new Error(`IP 请求失败: ${ipRes.status}`);
+        const data = await ipRes.json();
+        console.log("user ip: " + data.query)
+        if (!cancelled) setUserIp(data.query);
+      } catch (err) {
+        if (!cancelled) {
+          // 这里可以 setError(err.message)，或者至少 console.error
+          console.error("获取 IP 失败:", err);
+        }
+      }
+    }
+
+    fetchIp();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -241,11 +300,15 @@ export function MyAssistant() {
             <PanelLeftIcon />
           </Button>
         </div>
+
         {loadedSessionId === sessionId && initialMessages !== null ? (
           <AssistantThread
             key={sessionId}
             sessionId={sessionId}
             initialMessages={initialMessages}
+            outfitChat = {outfitChat}
+            setOutfitChat={setOutfitChat}
+            userIp = {userIp}
             onSend={noteSession}
           />
         ) : (
